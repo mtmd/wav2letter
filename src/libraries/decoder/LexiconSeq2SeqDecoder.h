@@ -121,7 +121,10 @@ class LexiconSeq2SeqDecoder : public Decoder {
         maxOutputLength_(maxOutputLength),
         isLmToken_(isLmToken) {}
 
-  void decodeStep(const float* emissions, int T, int N) override;
+  void decodeStep(
+      std::vector<const float*>& emissions,
+      std::vector<int>& lengthsVector,
+      int N) override;
 
   void prune(int lookBack = 0) override;
 
@@ -129,7 +132,7 @@ class LexiconSeq2SeqDecoder : public Decoder {
 
   DecodeResult getBestHypothesis(int lookBack = 0) const override;
 
-  std::vector<DecodeResult> getAllFinalHypothesis() const override;
+  std::vector<std::vector<DecodeResult>> getAllFinalHypothesis() const override;
 
  protected:
   LMPtr lm_;

@@ -206,9 +206,10 @@ DecodeResult getHypothesis(const DecoderState* node, const int finalFrame) {
 }
 
 template <class DecoderState>
-std::vector<DecodeResult> getAllHypothesis(
+void getAllHypothesis(
     const std::vector<DecoderState>& finalHyps,
-    const int finalFrame) {
+    const int finalFrame,
+    std::vector<std::vector<DecodeResult>>& results) {
   int nHyp = finalHyps.size();
 
   std::vector<DecodeResult> res(nHyp);
@@ -217,8 +218,7 @@ std::vector<DecodeResult> getAllHypothesis(
     const DecoderState* node = &finalHyps[r];
     res[r] = getHypothesis(node, finalFrame);
   }
-
-  return res;
+  results.push_back(res);
 }
 
 template <class DecoderState>

@@ -100,7 +100,10 @@ class LexiconFreeDecoder : public Decoder {
 
   void decodeBegin() override;
 
-  void decodeStep(const float* emissions, int T, int N) override;
+  void decodeStep(
+      std::vector<const float*>& emissions,
+      std::vector<int>& lengthsVector,
+      int N) override;
 
   void decodeEnd() override;
 
@@ -112,7 +115,7 @@ class LexiconFreeDecoder : public Decoder {
 
   DecodeResult getBestHypothesis(int lookBack = 0) const override;
 
-  std::vector<DecodeResult> getAllFinalHypothesis() const override;
+  std::vector<std::vector<DecodeResult>> getAllFinalHypothesis() const override;
 
  protected:
   LMPtr lm_;

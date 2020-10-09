@@ -28,7 +28,15 @@ void LexiconDecoder::decodeBegin() {
   nPrunedFrames_ = 0;
 }
 
-void LexiconDecoder::decodeStep(const float* emissions, int T, int N) {
+void LexiconDecoder::decodeStep(
+    std::vector<const float*>& emissionsVector,
+    std::vector<int>& lengthsVector,
+    int N) {
+  if (emissionsVector.size() != 1) {
+    throw std::runtime_error("LexiconDecoder only supports batch size of 1.");
+  }
+  auto emissions = emissionsVector[0];
+  auto T = lengthsVector[0];
   int startFrame = nDecodedFrames_ - nPrunedFrames_;
   // Extend hyp_ buffer
   if (hyp_.size() < startFrame + T + 2) {
@@ -261,13 +269,16 @@ void LexiconDecoder::decodeEnd() {
   ++nDecodedFrames_;
 }
 
-std::vector<DecodeResult> LexiconDecoder::getAllFinalHypothesis() const {
+std::vector<std::vector<DecodeResult>> LexiconDecoder::getAllFinalHypothesis()
+    const {
   int finalFrame = nDecodedFrames_ - nPrunedFrames_;
   if (finalFrame < 1) {
-    return std::vector<DecodeResult>{};
+    return std::vector<std::vector<DecodeResult>>{};
   }
-
-  return getAllHypothesis(hyp_.find(finalFrame)->second, finalFrame);
+  
+  std::vector<std::vector<DecodeResult>> results;
+  getAllHypothesis(hyp_.find(finalFrame)->second, finalFrame, results);
+  return results;
 }
 
 DecodeResult LexiconDecoder::getBestHypothesis(int lookBack) const {

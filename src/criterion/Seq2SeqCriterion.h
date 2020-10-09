@@ -146,6 +146,14 @@ class Seq2SeqCriterion : public SequenceCriterion {
     labelSmooth_ = labelSmooth;
   }
 
+  bool getInputFeeding() const {
+    return inputFeeding_;
+  }
+
+  int getNumberAttnRounds() const {
+    return nAttnRound_;
+  }
+
  private:
   int eos_;
   int maxDecoderOutputLen_;

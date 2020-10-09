@@ -28,6 +28,7 @@
 #include "libraries/decoder/LexiconDecoder.h"
 #include "libraries/decoder/LexiconFreeDecoder.h"
 #include "libraries/decoder/LexiconFreeSeq2SeqDecoder.h"
+#include "libraries/decoder/BatchedLexiconFreeSeq2SeqDecoder.h"
 #include "libraries/decoder/LexiconSeq2SeqDecoder.h"
 #include "libraries/lm/ConvLM.h"
 #include "libraries/lm/KenLM.h"
@@ -220,6 +221,7 @@ int main(int argc, char** argv) {
   }
 
   std::shared_ptr<LM> lm = std::make_shared<ZeroLM>();
+  std::shared_ptr<fl::Module> convLmModel;
   if (!FLAGS_lm.empty()) {
     if (FLAGS_lmtype == "kenlm") {
       lm = std::make_shared<KenLM>(FLAGS_lm, usrDict);
@@ -229,7 +231,6 @@ int main(int argc, char** argv) {
     } else if (FLAGS_lmtype == "convlm") {
       af::setDevice(0);
       LOG(INFO) << "[ConvLM]: Loading LM from " << FLAGS_lm;
-      std::shared_ptr<fl::Module> convLmModel;
       W2lSerializer::load(FLAGS_lm, convLmModel);
       convLmModel->eval();
 
@@ -409,7 +410,8 @@ int main(int argc, char** argv) {
                      &sliceNumWords,
                      &sliceNumTokens,
                      &sliceNumSamples,
-                     &sliceTime](int tid) {
+                     &sliceTime,
+                     &convLmModel](int tid) {
     try {
       /* 1. Prepare GPU-dependent resources */
       // Note: These 2 GPU-dependent models should be placed on different cards
@@ -484,12 +486,14 @@ int main(int argc, char** argv) {
                 << "[Decoder] LexiconSeq2Seq decoder with token-LM loaded in thread: "
                 << tid;
           } else {
-            decoder.reset(new LexiconFreeSeq2SeqDecoder(
+            decoder.reset(new BatchedLexiconFreeSeq2SeqDecoder(
+                FLAGS_lm_vocab,
+                usrDict,
+                convLmModel,
                 decoderOpt,
-                localLm,
                 eosIdx,
-                amUpdateFunc,
-                FLAGS_maxdecoderoutputlen));
+                FLAGS_maxdecoderoutputlen,
+                localCriterion));
             LOG(INFO)
                 << "[Decoder] LexiconFreeSeq2Seq decoder with token-LM loaded in thread: "
                 << tid;
@@ -539,107 +543,135 @@ int main(int argc, char** argv) {
 
       /* 3. Get data and run decoder */
       TestMeters meters;
-      EmissionTargetPair emissionTargetPair;
-      while (emissionQueue.get(emissionTargetPair)) {
-        const auto& emissionUnit = emissionTargetPair.first;
-        const auto& targetUnit = emissionTargetPair.second;
+      std::vector<EmissionTargetPair> emissionTargetPair(
+          FLAGS_decoder_batch_size);
+      std::vector<const float*> emissions(FLAGS_decoder_batch_size);
+      std::vector<int> numFrames(FLAGS_decoder_batch_size);
 
-        const auto& nFrames = emissionUnit.nFrames;
-        const auto& nTokens = emissionUnit.nTokens;
-        const auto& emission = emissionUnit.emission;
-        const auto& sampleId = emissionUnit.sampleId;
-        const auto& wordTarget = targetUnit.wordTargetStr;
-        const auto& tokenTarget = targetUnit.tokenTarget;
+      while (true) {
+        int num_utterances = 0;
+        while (num_utterances < FLAGS_decoder_batch_size) {
+          if (emissionQueue.get(emissionTargetPair[num_utterances])) {
+            num_utterances++;
+          } else {
+            break;
+          }
+        }
+        if (num_utterances == 0) {
+          break;
+        }
+
+        emissions.resize(num_utterances);
+        numFrames.resize(num_utterances);
+        int numTokens = emissionTargetPair[0].first.nTokens;
+        for (int i = 0; i < num_utterances; i++) {
+          emissions[i] = emissionTargetPair[i].first.emission.data();
+          numFrames[i] = emissionTargetPair[i].first.nFrames;
+        }
 
         // DecodeResult
         meters.timer.reset();
         meters.timer.resume();
-        const auto& results =
-            decoder->decode(emission.data(), nFrames, nTokens);
+        const auto& batchResults =
+            decoder->decode(emissions, numFrames, numTokens);
         meters.timer.stop();
-
-        int nTopHyps = FLAGS_isbeamdump ? results.size() : 1;
-        for (int i = 0; i < nTopHyps; i++) {
-          // Cleanup predictions
-          auto rawWordPrediction = results[i].words;
-          auto rawTokenPrediction = results[i].tokens;
-
-          auto letterTarget = tknTarget2Ltr(tokenTarget, tokenDict);
-          auto letterPrediction =
-              tknPrediction2Ltr(rawTokenPrediction, tokenDict);
-          std::vector<std::string> wordPrediction;
-          if (FLAGS_uselexicon) {
-            rawWordPrediction =
-                validateIdx(rawWordPrediction, wordDict.getIndex(kUnkToken));
-            wordPrediction = wrdIdx2Wrd(rawWordPrediction, wordDict);
-          } else {
-            wordPrediction = tkn2Wrd(letterPrediction);
-          }
-          auto wordTargetStr = join(" ", wordTarget);
-          auto wordPredictionStr = join(" ", wordPrediction);
-
-          // Normal decoding and computing WER
-          if (!FLAGS_isbeamdump) {
-            meters.werSlice.add(wordPrediction, wordTarget);
-            meters.lerSlice.add(letterPrediction, letterTarget);
-
-            if (!FLAGS_sclite.empty()) {
-              std::string suffix = " (" + sampleId + ")\n";
-              writeHyp(wordPredictionStr + suffix);
-              writeRef(wordTargetStr + suffix);
+        sliceTime[tid] += meters.timer.value();
+        int sampleCounter = 0;
+        for (auto& results : batchResults) {
+          int nTopHyps = FLAGS_isbeamdump ? results.size() : 1;
+          for (int i = 0; i < nTopHyps; i++) {
+            // Cleanup predictions
+            auto rawWordPrediction = results[i].words;
+            auto rawTokenPrediction = results[i].tokens;
+            auto letterTarget = tknTarget2Ltr(
+                emissionTargetPair[sampleCounter].second.tokenTarget,
+                tokenDict);
+            auto letterPrediction =
+                tknPrediction2Ltr(rawTokenPrediction, tokenDict);
+            std::vector<std::string> wordPrediction;
+            if (FLAGS_uselexicon) {
+              rawWordPrediction =
+                  validateIdx(rawWordPrediction, wordDict.getIndex(kUnkToken));
+              wordPrediction = wrdIdx2Wrd(rawWordPrediction, wordDict);
+            } else {
+              wordPrediction = tkn2Wrd(letterPrediction);
             }
+            auto wordTargetStr = join(
+                " ", emissionTargetPair[sampleCounter].second.wordTargetStr);
+            auto wordPredictionStr = join(" ", wordPrediction);
+            // Normal decoding and computing WER
+            if (!FLAGS_isbeamdump) {
+              meters.werSlice.add(
+                  wordPrediction,
+                  emissionTargetPair[sampleCounter].second.wordTargetStr);
+              meters.lerSlice.add(letterPrediction, letterTarget);
 
-            if (FLAGS_show) {
-              meters.wer.reset();
-              meters.ler.reset();
-              meters.wer.add(wordPrediction, wordTarget);
-              meters.ler.add(letterPrediction, letterTarget);
-
-              std::stringstream buffer;
-              buffer << "|T|: " << wordTargetStr << std::endl;
-              buffer << "|P|: " << wordPredictionStr << std::endl;
-              if (FLAGS_showletters) {
-                buffer << "|t|: " << join(" ", letterTarget) << std::endl;
-                buffer << "|p|: " << join(" ", letterPrediction) << std::endl;
-              }
-              buffer << "[sample: " << sampleId
-                     << ", WER: " << meters.wer.value()[0]
-                     << "\%, LER: " << meters.ler.value()[0]
-                     << "\%, slice WER: " << meters.werSlice.value()[0]
-                     << "\%, slice LER: " << meters.lerSlice.value()[0]
-                     << "\%, decoded samples (thread " << tid
-                     << "): " << sliceNumSamples[tid] + 1 << "]" << std::endl;
-
-              std::cout << buffer.str();
               if (!FLAGS_sclite.empty()) {
-                writeLog(buffer.str());
+                std::string suffix = " (" +
+                    emissionTargetPair[sampleCounter].first.sampleId + ")\n";
+                writeHyp(wordPredictionStr + suffix);
+                writeRef(wordTargetStr + suffix);
               }
+              if (FLAGS_show) {
+                meters.wer.reset();
+                meters.ler.reset();
+                meters.wer.add(
+                    wordPrediction,
+                    emissionTargetPair[sampleCounter].second.wordTargetStr);
+                meters.ler.add(letterPrediction, letterTarget);
+
+                std::stringstream buffer;
+                buffer << "|T|: " << wordTargetStr << std::endl;
+                buffer << "|P|: " << wordPredictionStr << std::endl;
+                if (FLAGS_showletters) {
+                  buffer << "|t|: " << join(" ", letterTarget) << std::endl;
+                  buffer << "|p|: " << join(" ", letterPrediction) << std::endl;
+                }
+                buffer << "[sample: "
+                       << emissionTargetPair[sampleCounter].first.sampleId
+                       << ", WER: " << meters.wer.value()[0]
+                       << "\%, LER: " << meters.ler.value()[0]
+                       << "\%, slice WER: " << meters.werSlice.value()[0]
+                       << "\%, slice LER: " << meters.lerSlice.value()[0]
+                       << "\%, decoded samples (thread " << tid
+                       << "): " << sliceNumSamples[tid] + 1 << "]" << std::endl;
+
+                std::cout << buffer.str();
+                if (!FLAGS_sclite.empty()) {
+                  writeLog(buffer.str());
+                }
+              }
+
+              // Update conters
+              sliceNumWords[tid] +=
+                  emissionTargetPair[sampleCounter].second.wordTargetStr.size();
+              sliceNumTokens[tid] += letterTarget.size();
+              sliceNumSamples[tid] += 1;
+            } // Beam Dump
+            else {
+              meters.wer.reset();
+              meters.wer.add(
+                  wordPrediction,
+                  emissionTargetPair[sampleCounter].second.wordTargetStr);
+              auto wer = meters.wer.value()[0];
+
+              if (FLAGS_sclite.empty()) {
+                LOG(FATAL)
+                    << "FLAGS_sclite is empty, nowhere to dump the beam.";
+              }
+
+              auto score = results[i].score;
+              auto amScore = results[i].amScore;
+              auto lmScore = results[i].lmScore;
+              auto outString =
+                  emissionTargetPair[sampleCounter].first.sampleId + " | " +
+                  std::to_string(score) + " | " + std::to_string(amScore) +
+                  " | " + std::to_string(lmScore) + " | " +
+                  std::to_string(wer) + " | " + wordPredictionStr + "\n";
+              writeHyp(outString);
             }
-
-            // Update conters
-            sliceNumWords[tid] += wordTarget.size();
-            sliceNumTokens[tid] += letterTarget.size();
-            sliceTime[tid] += meters.timer.value();
-            sliceNumSamples[tid] += 1;
           }
-          // Beam Dump
-          else {
-            meters.wer.reset();
-            meters.wer.add(wordPrediction, wordTarget);
-            auto wer = meters.wer.value()[0];
-
-            if (FLAGS_sclite.empty()) {
-              LOG(FATAL) << "FLAGS_sclite is empty, nowhere to dump the beam.";
-            }
-
-            auto score = results[i].score;
-            auto amScore = results[i].amScore;
-            auto lmScore = results[i].lmScore;
-            auto outString = sampleId + " | " + std::to_string(score) + " | " +
-                std::to_string(amScore) + " | " + std::to_string(lmScore) +
-                " | " + std::to_string(wer) + " | " + wordPredictionStr + "\n";
-            writeHyp(outString);
-          }
+          sampleCounter++;
         }
       }
       sliceWer[tid] = meters.werSlice.value()[0];

@@ -20,7 +20,16 @@
 
 namespace w2l {
 
-void LexiconSeq2SeqDecoder::decodeStep(const float* emissions, int T, int N) {
+void LexiconSeq2SeqDecoder::decodeStep(
+    std::vector<const float*>& emissionsVector,
+    std::vector<int>& lengthsVector,
+    int N) {
+  if (emissionsVector.size() != 1) {
+    throw std::runtime_error(
+        "LexiconSeq2SeqDecoder only supports batch size of 1.");
+  }
+  auto emissions = emissionsVector[0];
+  auto T = lengthsVector[0];
   // Extend hyp_ buffer
   if (hyp_.size() < maxOutputLength_ + 2) {
     for (int i = hyp_.size(); i < maxOutputLength_ + 2; i++) {
@@ -222,8 +231,12 @@ void LexiconSeq2SeqDecoder::decodeStep(const float* emissions, int T, int N) {
   }
 }
 
-std::vector<DecodeResult> LexiconSeq2SeqDecoder::getAllFinalHypothesis() const {
-  return getAllHypothesis(hyp_.find(maxOutputLength_ + 1)->second, hyp_.size());
+std::vector<std::vector<DecodeResult>>
+LexiconSeq2SeqDecoder::getAllFinalHypothesis() const {
+  std::vector<std::vector<DecodeResult>> results;
+  getAllHypothesis(
+      hyp_.find(maxOutputLength_ + 1)->second, hyp_.size(), results);
+  return results;
 }
 
 DecodeResult LexiconSeq2SeqDecoder::getBestHypothesis(int /* unused */) const {

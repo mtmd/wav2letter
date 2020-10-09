@@ -220,6 +220,10 @@ DEFINE_int32(
     lm_memory,
     5000,
     "total memory size for batch during forward pass ");
+DEFINE_int32(
+    decoder_batch_size,
+    1,
+    "Number of utterances to decode simultaneously.");
 
 DEFINE_int32(emission_queue_size, 3000, "max size of emission queue");
 

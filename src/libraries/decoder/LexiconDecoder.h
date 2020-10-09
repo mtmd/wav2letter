@@ -119,7 +119,10 @@ class LexiconDecoder : public Decoder {
 
   void decodeBegin() override;
 
-  void decodeStep(const float* emissions, int T, int N) override;
+  void decodeStep(
+      std::vector<const float*>& emissionsVector,
+      std::vector<int>& lengthsVector,
+      int N) override;
 
   void decodeEnd() override;
 
@@ -131,7 +134,7 @@ class LexiconDecoder : public Decoder {
 
   DecodeResult getBestHypothesis(int lookBack = 0) const override;
 
-  std::vector<DecodeResult> getAllFinalHypothesis() const override;
+  std::vector<std::vector<DecodeResult>> getAllFinalHypothesis() const override;
 
  protected:
   // Lexicon trie to restrict beam-search decoder
